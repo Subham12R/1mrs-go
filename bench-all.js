@@ -53,9 +53,12 @@ function buildServer() {
 
 function startServer(exe, mode) {
   const env = { ...process.env, CACHE_MODE: mode };
+  const log = fs.openSync(`bench-server-${mode}.log`, "w"); // server output for debugging
+  const stdio = ["ignore", log, log];
   const p = process.env.SERVER_CMD
-    ? spawn(process.env.SERVER_CMD, { env, shell: true, stdio: "ignore" })
-    : spawn(exe, [], { env, stdio: "ignore" });
+    ? spawn(process.env.SERVER_CMD, { env, shell: true, stdio })
+    : spawn(exe, [], { env, stdio });
+  p.on("exit", (code) => { if (!p.killedByUs) console.error(`  !! server exited unexpectedly (code ${code}), see bench-server-${mode}.log`); });
   return p;
 }
 
@@ -71,7 +74,7 @@ function runMulti(workload) {
   const m2 = out.match(/p50 (\d+) ms.*?p99 (\d+) ms.*?max (\d+) ms/);
   const m3 = out.match(/2xx (\d+)\s+non-2xx (\d+)\s+errors (\d+)\s+timeouts (\d+)/);
   if (!m1 || !m2 || !m3) { console.warn("  could not parse multi.js output:\n" + out + (r.stderr || "")); return null; }
-  return { rps: +m1[3], secs: +m1[2], p50: +m2[1], p99: +m2[2], max: +m2[3], ok: +m3[1], bad: +m3[2] + +m3[3] + +m3[4] };
+  return { rps: +m1[3], secs: +m1[2], p50: +m2[1], p99: +m2[2], max: +m2[3], ok: +m3[1], non2xx: +m3[2], errors: +m3[3], timeouts: +m3[4], bad: +m3[2] + +m3[3] + +m3[4] };
 }
 
 const median = (a) => { const s = [...a].sort((x, y) => x - y); const n = s.length; return n % 2 ? s[(n - 1) / 2] : Math.round((s[n / 2 - 1] + s[n / 2]) / 2); };
@@ -92,11 +95,18 @@ const fmt = (n) => n.toLocaleString("en-US");
         const r = runMulti(wl);
         if (!r) continue;
         res.push(r);
-        console.log(`  ${wl} run ${i}${i === 1 ? " (cold)" : ""}: ${fmt(r.rps)} req/s  p50 ${r.p50} ms  p99 ${r.p99} ms  bad ${r.bad}`);
+        console.log(`  ${wl} run ${i}${i === 1 ? " (cold)" : ""}: ${fmt(r.rps)} req/s  p50 ${r.p50} ms  p99 ${r.p99} ms  2xx ${fmt(r.ok)}  non-2xx ${r.non2xx}  errors ${r.errors}  timeouts ${r.timeouts}`);
+        if (r.bad > total * 0.01) {
+          console.error(`  !! INVALID RUN: ${fmt(r.bad)} failed requests. Stopping. Check bench-server-${mode}.log`);
+          process.exitCode = 1;
+          server.killedByUs = true; server.kill();
+          process.exit(1);
+        }
         await sleep(2000);
       }
       rows.push({ mode, wl, res });
     }
+    server.killedByUs = true;
     server.kill();
     await sleep(2000);
   }
