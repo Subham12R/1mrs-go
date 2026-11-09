@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 
 	"log"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 )
 
 type Item struct {
@@ -26,34 +28,130 @@ type Item struct {
 type server struct {
 	db  *pgxpool.Pool
 	rdb *redis.Client
+	l1  *l1Cache
+	sf  singleflight.Group
 }
 
+type l1Entry struct {
+	val []byte
+	exp int64
+}
+
+type l1Cache struct {
+	mu sync.RWMutex
+	m  map[string]l1Entry
+}
+
+const l1TTL = 5 * time.Second
 const cacheTTL = 60 * time.Second
+
+func newL1() *l1Cache { return &l1Cache{m: make(map[string]l1Entry)} }
+
+func (c *l1Cache) set(k string, v []byte, ttl time.Duration) {
+	c.mu.Lock()
+	c.m[k] = l1Entry{val: v, exp: time.Now().Add(ttl).UnixNano()}
+	c.mu.Unlock()
+}
+
+func (c *l1Cache) get(k string) ([]byte, bool) {
+	c.mu.RLock()
+	e, ok := c.m[k]
+	c.mu.RUnlock()
+	if !ok || time.Now().UnixNano() > e.exp {
+		return nil, false
+	}
+	return e.val, true
+}
+
+type result struct {
+	b   []byte
+	src string // "L2" or "DB"
+}
 
 // Setting up the DB query server
 
+// func (s *server) getItem(w http.ResponseWriter, r *http.Request) {
+// 	id := r.PathValue("id")
+// 	key := "item: " + id
+// 	ctx := r.Context()
+
+// 	b, err := s.rdb.Get(ctx, key).Bytes()
+
+// 	if err == nil {
+// 		w.Header().Set("Content-Type", "application/json")
+// 		w.Header().Set("X-Cache", "HIT")
+// 		w.Write(b)
+// 		return
+// 	}
+
+// 	if !errors.Is(err, redis.Nil) {
+// 		log.Printf("redis get %s: %v", key, err)
+// 	}
+
+// 	var it Item
+
+// 	err = s.db.QueryRow(ctx,
+// 		"SELECT id, name FROM items WHERE id=$1", id).Scan(&it.ID, &it.Name)
+// 	if err != nil {
+// 		if errors.Is(err, pgx.ErrNoRows) {
+// 			http.Error(w, "not found", http.StatusNotFound)
+// 			return
+// 		}
+// 		log.Printf("getItem id=%s: %v", id, err)
+// 		http.Error(w, "internal error", http.StatusInternalServerError)
+// 		return
+// 	}
+
+// 	b, _ = json.Marshal(it)
+
+// 	if err := s.rdb.Set(ctx, key, b, cacheTTL).Err(); err != nil {
+// 		log.Printf("redis set %s: %v", key, err)
+// 	}
+
+// 	w.Header().Set("Content-Type", "application/json")
+// 	w.Header().Set("X-Cache", "MISS")
+// 	w.Write(b)
+
+// }
+
 func (s *server) getItem(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	key := "item: " + id
-	ctx := r.Context()
+	key := "item:" + id
 
-	b, err := s.rdb.Get(ctx, key).Bytes()
+	w.Header().Set("Content-Type", "application/json")
 
-	if err == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Cache", "HIT")
+	// L1: memory, no network
+	if b, ok := s.l1.get(key); ok {
+		w.Header().Set("X-Cache", "L1")
 		w.Write(b)
 		return
 	}
 
-	if !errors.Is(err, redis.Nil) {
-		log.Printf("redis get %s: %v", key, err)
-	}
+	// L2 + DB, collapsed: 1000 simultaneous misses -> 1 Redis/DB call
+	v, err, _ := s.sf.Do(key, func() (any, error) {
+		// shared work must not die if the first caller disconnects
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Second)
+		defer cancel()
 
-	var it Item
+		b, err := s.rdb.Get(ctx, key).Bytes()
+		if err == nil {
+			return result{b, "L2"}, nil
+		}
+		if !errors.Is(err, redis.Nil) {
+			log.Printf("redis get %s: %v", key, err)
+		}
 
-	err = s.db.QueryRow(ctx,
-		"SELECT id, name FROM items WHERE id=$1", id).Scan(&it.ID, &it.Name)
+		var it Item
+		if err := s.db.QueryRow(ctx,
+			"SELECT id, name FROM items WHERE id=$1", id).Scan(&it.ID, &it.Name); err != nil {
+			return nil, err
+		}
+		b, _ = json.Marshal(it)
+		if err := s.rdb.Set(ctx, key, b, cacheTTL).Err(); err != nil {
+			log.Printf("redis set %s: %v", key, err)
+		}
+		return result{b, "DB"}, nil
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -64,16 +162,10 @@ func (s *server) getItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b, _ = json.Marshal(it)
-
-	if err := s.rdb.Set(ctx, key, b, cacheTTL).Err(); err != nil {
-		log.Printf("redis set %s: %v", key, err)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Cache", "MISS")
-	w.Write(b)
-
+	res := v.(result)
+	s.l1.set(key, res.b, l1TTL)
+	w.Header().Set("X-Cache", res.src)
+	w.Write(res.b)
 }
 
 // Setting up the main server pool and connection config
@@ -122,7 +214,7 @@ func main() {
 	}
 	log.Println("redis connected")
 
-	s := &server{db: db, rdb: rdb}
+	s := &server{db: db, rdb: rdb, l1: newL1()}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /items/{id}", s.getItem)
