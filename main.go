@@ -217,7 +217,20 @@ func main() {
 	s := &server{db: db, rdb: rdb, l1: newL1()}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /items/{id}", s.getItem)
+	// CACHE_MODE picks the stage to benchmark: db | redis | l1 (default)
+	mode := os.Getenv("CACHE_MODE")
+	var handler http.HandlerFunc
+	switch mode {
+	case "db":
+		handler = s.getItemDB // Stage 1: Postgres only
+	case "redis":
+		handler = s.getItemRedis // Stage 3: Redis cache-aside
+	default:
+		mode = "l1"
+		handler = s.getItem // Stage 4: L1 + Redis + singleflight
+	}
+	log.Println("cache mode:", mode)
+	mux.HandleFunc("GET /items/{id}", handler)
 	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
